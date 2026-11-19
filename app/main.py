@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import review
 from .config import settings
 from .db import connect, ensure_schema
 from .drill import DrillError, store
@@ -39,6 +40,14 @@ async def lifespan(_app: FastAPI):
             if attempt == 30:
                 raise
             time.sleep(1)
+    # Release-review registry + logical publication/subscription. The primary
+    # must already be reachable (ensure_schema above); a missing replica only
+    # downgrades review reads to primary-only and never blocks startup.
+    try:
+        review_status = review.provision()
+        logger.info("release review provisioning: %s", review_status)
+    except Exception:
+        logger.exception("release review provisioning failed")
     # Any session naming this app instance is a leftover from a previous
     # process (a restart loses the in-memory registry): end it and start clean.
     try:
@@ -204,6 +213,174 @@ async def api_end(drill_id: str, token: str = Form(...)) -> JSONResponse:
     return JSONResponse({"ok": True, "drill": store.snapshot(store.require(drill_id))})
 
 
+# ---------------------------------------------------------------------------
+# Release review (logical-subscription drill)
+# ---------------------------------------------------------------------------
+
+
+def _review_context(
+    request: Request,
+    *,
+    form: dict[str, str] | None = None,
+    message: str | None = None,
+    error: str | None = None,
+    result: dict[str, Any] | None = None,
+    registered: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "request": request,
+        "form": form or {},
+        "review_message": message,
+        "review_error": error,
+        "review_result": result,
+        "registered": registered,
+        "subscription": review.subscription_status(),
+        "connections": review.connection_summary(),
+    }
+
+
+@app.get("/review", response_class=HTMLResponse)
+async def review_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request, "review.html", _review_context(request)
+    )
+
+
+@app.post("/review/register")
+async def review_register(
+    request: Request,
+    service: str = Form(...),
+    artifact_version: str = Form(...),
+) -> HTMLResponse:
+    try:
+        registered = review.register_release(service, artifact_version)
+    except review.ReviewError as exc:
+        return templates.TemplateResponse(
+            request,
+            "review.html",
+            _review_context(
+                request,
+                form={"service": service, "artifact_version": artifact_version},
+                error=str(exc),
+            ),
+            status_code=exc.status_code,
+        )
+    # PRG: after the primary commit the response carries the review link with
+    # service name and revision.
+    return RedirectResponse(
+        url=f"{registered['review_path']}?registered=1", status_code=303
+    )
+
+
+@app.get("/review/{service}/{revision}", response_class=HTMLResponse)
+async def review_link_page(
+    request: Request, service: str, revision: int
+) -> HTMLResponse:
+    try:
+        result = review.lookup_revision(service, revision)
+    except review.ReviewError as exc:
+        return templates.TemplateResponse(
+            request,
+            "review.html",
+            _review_context(request, error=str(exc)),
+            status_code=exc.status_code,
+        )
+    message = None
+    if request.query_params.get("registered") == "1":
+        message = "主库提交成功，本次登记的复核链接已生成（见下方）。"
+    return templates.TemplateResponse(
+        request,
+        "review.html",
+        _review_context(request, result=result, message=message),
+    )
+
+
+@app.post("/review/subscription/{action}")
+async def review_subscription_form(
+    request: Request, action: str
+) -> HTMLResponse:
+    if action not in ("pause", "resume"):
+        return templates.TemplateResponse(
+            request,
+            "review.html",
+            _review_context(request, error="不支持的订阅操作。"),
+            status_code=404,
+        )
+    try:
+        review.set_subscription_paused(paused=(action == "pause"))
+    except review.ReviewError as exc:
+        return templates.TemplateResponse(
+            request,
+            "review.html",
+            _review_context(request, error=str(exc)),
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url="/review", status_code=303)
+
+
+# JSON API for automated checks ------------------------------------------------
+
+
+@app.get("/api/review/register", response_class=JSONResponse)
+async def api_review_register_get() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": "请使用 POST 提交 service 与 artifact_version 表单字段。",
+        },
+        status_code=405,
+    )
+
+
+@app.post("/api/review/register", response_class=JSONResponse)
+async def api_review_register(
+    service: str = Form(...), artifact_version: str = Form(...)
+) -> JSONResponse:
+    try:
+        registered = review.register_release(service, artifact_version)
+    except review.ReviewError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "kind": type(exc).__name__},
+            status_code=exc.status_code,
+        )
+    return JSONResponse({"ok": True, "registration": registered})
+
+
+@app.get("/api/review/lookup/{service}/{revision}", response_class=JSONResponse)
+async def api_review_lookup(service: str, revision: int) -> JSONResponse:
+    try:
+        result = review.lookup_revision(service, revision)
+    except review.ReviewError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "kind": type(exc).__name__},
+            status_code=exc.status_code,
+        )
+    return JSONResponse({"ok": True, "result": result})
+
+
+@app.get("/api/review/subscription", response_class=JSONResponse)
+async def api_review_subscription() -> JSONResponse:
+    return JSONResponse(
+        {"ok": True, "subscription": review.subscription_status()}
+    )
+
+
+@app.post("/api/review/subscription/{action}", response_class=JSONResponse)
+async def api_review_subscription_action(action: str) -> JSONResponse:
+    if action not in ("pause", "resume"):
+        return JSONResponse(
+            {"ok": False, "error": "action 必须是 pause 或 resume。"}, status_code=404
+        )
+    try:
+        status = review.set_subscription_paused(paused=(action == "pause"))
+    except review.ReviewError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "kind": type(exc).__name__},
+            status_code=exc.status_code,
+        )
+    return JSONResponse({"ok": True, "subscription": status})
+
+
 @app.get("/healthz", response_class=JSONResponse)
 async def healthz() -> JSONResponse:
     try:
@@ -212,4 +389,13 @@ async def healthz() -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
     active = store.active()
-    return JSONResponse({"ok": True, "active_drill_id": active.id if active else None})
+    return JSONResponse(
+        {
+            "ok": True,
+            "active_drill_id": active.id if active else None,
+            "review": {
+                "subscription": review.subscription_status(),
+                "connections": review.connection_summary(),
+            },
+        }
+    )

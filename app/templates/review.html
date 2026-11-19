@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>发布复核 · PostgreSQL 行锁演练台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>发布复核（逻辑订阅演练）</h1>
+  <p class="sub">
+    登记制品版本到主库，取得带服务名与修订号的复核链接；链接先限时读逻辑订阅库，
+    缺行、修订落后或读失败再限时查主库。
+    <a href="/" style="color:var(--accent)">返回演练台首页</a>
+  </p>
+</header>
+
+<main>
+{% if review_error %}<div class="banner banner-error" role="alert">{{ review_error }}</div>{% endif %}
+{% if review_message %}<div class="banner banner-ok" role="status">{{ review_message }}</div>{% endif %}
+
+<section class="panel">
+  <h2>登记一版制品（写入主库）</h2>
+  <form method="post" action="/review/register" class="review-form">
+    <label>服务名
+      <input type="text" name="service" required maxlength="128"
+             value="{{ form.service or '' }}" placeholder="例如 payment-service">
+    </label>
+    <label>制品版本
+      <input type="text" name="artifact_version" required maxlength="128"
+             value="{{ form.artifact_version or '' }}" placeholder="例如 1.4.2 或 2026.11.0-rc1">
+    </label>
+    <button type="submit" class="btn btn-primary">提交到主库并生成复核链接</button>
+  </form>
+  <p class="hint">同一服务的修订号按主库提交顺序递增；回发旧制品同样产生新修订。</p>
+</section>
+
+<section class="panel">
+  <h2>真实逻辑订阅</h2>
+  <dl class="kv">
+    <dt>订阅名</dt><dd class="mono">{{ subscription.sub_name }}</dd>
+    <dt>订阅状态</dt>
+    <dd>
+      {% if not subscription.configured %}
+        <span class="tag tag-bad">不可用</span>
+        <span class="hint">{{ subscription.error or '' }}</span>
+      {% elif subscription.enabled %}
+        <span class="tag tag-ok">运行中（已启用）</span>
+      {% else %}
+        <span class="tag tag-warn">已暂停（DISABLE）</span>
+      {% endif %}
+    </dd>
+    <dt>主库</dt><dd class="mono">{{ connections.primary }}</dd>
+    <dt>逻辑订阅库</dt><dd class="mono">{{ connections.replica or '未配置' }}</dd>
+  </dl>
+  <div class="controls">
+    {% if subscription.configured and subscription.enabled %}
+    <form method="post" action="/review/subscription/pause" class="inline"
+          onsubmit="return confirm('确认暂停真实逻辑订阅？暂停期间主库的新登记不会进入订阅库，复核链接将改从主库读取。');">
+      <button type="submit" class="btn btn-danger">暂停订阅</button>
+    </form>
+    {% elif subscription.configured %}
+    <form method="post" action="/review/subscription/resume" class="inline">
+      <button type="submit" class="btn btn-primary">恢复订阅</button>
+    </form>
+    {% else %}
+    <span class="hint">订阅库不可用，无法暂停/恢复。</span>
+    {% endif %}
+  </div>
+</section>
+
+{% if review_result %}
+{% set r = review_result %}
+<section class="panel" id="review-result"
+         data-source="{{ r.source }}"
+         data-service="{{ r.service }}"
+         data-revision="{{ r.requested_revision }}">
+  <div class="panel-head">
+    <h2>复核结果 · 服务 <span class="mono">{{ r.service }}</span> · 修订 <span class="mono">#{{ r.requested_revision }}</span></h2>
+    {% if r.source == 'replica' %}<span class="tag tag-ok">读取自：{{ r.source_label }}</span>
+    {% elif r.source == 'primary' %}<span class="tag tag-warn">读取自：{{ r.source_label }}</span>
+    {% else %}<span class="tag tag-bad">无法确认</span>{% endif %}
+  </div>
+
+  <p class="meta">
+    复核链接（重启后仍可用）：
+    <span class="mono" id="review-link"></span>
+  </p>
+
+  {% if r.record %}
+  <dl class="kv">
+    <dt>服务名</dt><dd class="mono">{{ r.record.service }}</dd>
+    <dt>修订号</dt><dd class="mono">{{ r.record.revision }}</dd>
+    <dt>制品版本</dt><dd class="mono">{{ r.record.artifact_version }}</dd>
+    <dt>主库登记时间</dt><dd class="mono">{{ r.record.created_at }}</dd>
+    <dt>实际读取的库</dt><dd><span class="tag">{{ r.source_label }}</span></dd>
+  </dl>
+  {% else %}
+  <div class="banner banner-error">
+    两端都无法读到达标记录，<strong>无法确认</strong>该服务/修订的登记。
+  </div>
+  {% endif %}
+
+  <h3>读取过程</h3>
+  <table class="tbl">
+    <thead><tr><th>库</th><th>该服务最高修订</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>{{ connections.replica_label }}</td>
+        <td class="mono">{{ r.replica_highest if r.replica_highest is not none else '—' }}</td>
+        <td>
+          {% if r.source == 'replica' %}<span class="tag tag-ok">命中达标记录</span>
+          {% else %}<span class="tag tag-bad">{{ r.replica_skipped_reason or r.replica_error or '未读取' }}</span>{% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>{{ connections.primary_label }}</td>
+        <td class="mono">{{ r.primary_highest if r.primary_highest is not none else '—' }}</td>
+        <td>
+          {% if r.source == 'primary' %}<span class="tag tag-ok">命中达标记录</span>
+          {% elif r.source == 'unconfirmed' and r.primary_error %}<span class="tag tag-bad">{{ r.primary_error }}</span>
+          {% elif r.source == 'replica' %}<span class="hint">订阅库已命中，未再查主库</span>
+          {% else %}<span class="hint">—</span>{% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="hint">
+    订阅恢复并追平后刷新本页，读取来源会从“主库”切换为“逻辑订阅库”。
+  </p>
+</section>
+{% endif %}
+</main>
+
+<script>
+(function () {
+  var linkEl = document.getElementById("review-link");
+  var panel = document.getElementById("review-result");
+  if (linkEl && panel) {
+    var path = "/review/" + encodeURIComponent(panel.dataset.service) +
+               "/" + panel.dataset.revision;
+    linkEl.textContent = window.location.origin + path;
+  }
+  // While a paused subscription is catching up (page currently served from the
+  // primary), auto-refresh so the moment the replica catches up the page shows
+  // the replica as the actual source.
+  if (panel && panel.dataset.source === "primary") {
+    setTimeout(function () { window.location.reload(); }, 2000);
+  }
+})();
+</script>
+</body>
+</html>
